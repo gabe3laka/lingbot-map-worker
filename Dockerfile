@@ -28,7 +28,8 @@ RUN python3.10 -m pip install \
 RUN python3.10 -m pip install \
     runpod requests fastapi uvicorn \
     flashinfer-python \
-    huggingface_hub
+    huggingface_hub \
+    open3d
 
 # Clone & install LingBot-Map
 RUN git clone https://github.com/robbyant/lingbot-map /app/lingbot-map
