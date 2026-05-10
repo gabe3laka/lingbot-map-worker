@@ -12,9 +12,8 @@ import runpod
 # ----------------------------
 def ensure_model():
     """
-    Download the LingBot-Map checkpoint from Hugging Face if it is not
-    already present.  Requires HF_TOKEN env var (set in RunPod endpoint
-    settings -- never put it in the repo).
+    Download the LingBot-Map checkpoint from Hugging Face if not present.
+    Requires HF_TOKEN env var set in RunPod endpoint settings.
     """
     model_dir = Path(os.getenv("MODEL_DIR", "/models"))
     model_file = os.getenv("MODEL_FILE", "lingbot-map-long.pt")
@@ -86,10 +85,43 @@ def find_any_ply(root: Path) -> Path:
     return candidates[0]
 
 
+def get_patient_id(scan_id: str) -> str:
+    """
+    Look up patient_id from the scans table using service-role credentials.
+    Required so we can upload to {patient_id}/{scan_id}/pointcloud.ply
+    which matches the RLS policy on the scan-pointclouds bucket.
+    """
+    supabase_url = _require_env("SUPABASE_URL").rstrip("/")
+    service_role_key = _require_env("SUPABASE_SERVICE_ROLE_KEY")
+
+    resp = requests.get(
+        f"{supabase_url}/rest/v1/scans",
+        params={"id": f"eq.{scan_id}", "select": "patient_id"},
+        headers={
+            "apikey": service_role_key,
+            "Authorization": f"Bearer {service_role_key}",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    rows = resp.json()
+    if not rows:
+        raise RuntimeError(f"No scan row found for scan_id={scan_id}")
+    patient_id = rows[0].get("patient_id")
+    if not patient_id:
+        raise RuntimeError(f"scan row has no patient_id for scan_id={scan_id}")
+    return patient_id
+
+
 def upload_ply_to_supabase(file_path: Path, object_path: str) -> str:
+    """
+    Upload to Supabase Storage (PRIVATE bucket) using Service Role key.
+    Returns the storage path (e.g. {patient_id}/{scan_id}/pointcloud.ply).
+    """
     supabase_url = _require_env("SUPABASE_URL").rstrip("/")
     service_role_key = _require_env("SUPABASE_SERVICE_ROLE_KEY")
     bucket = _require_env("SUPABASE_BUCKET")
+
     upload_url = f"{supabase_url}/storage/v1/object/{bucket}/{object_path}"
     headers = {
         "authorization": f"Bearer {service_role_key}",
@@ -103,12 +135,14 @@ def upload_ply_to_supabase(file_path: Path, object_path: str) -> str:
     return object_path
 
 
-def post_callback(callback_url: str, payload: dict):
-    r = requests.post(callback_url, json=payload, timeout=60)
-    r.raise_for_status()
+def run_lingbot_map(job: dict, scan_id: str, scratch_root: Path, scan_type: str) -> Path:
+    """
+    Run lingbot-map demo.py.
 
-
-def run_lingbot_map(job: dict, scan_id: str, scratch_root: Path, windowed: bool) -> Path:
+    FIX 4: --mode streaming is not a valid flag in LingBot-Map.
+    Default (no --mode flag) = streaming.
+    Only pass --mode windowed for wand scans.
+    """
     model_dir = os.getenv("MODEL_DIR", "/models")
     model_file = os.getenv("MODEL_FILE", "lingbot-map-long.pt")
     model_path = Path(model_dir) / model_file
@@ -118,29 +152,30 @@ def run_lingbot_map(job: dict, scan_id: str, scratch_root: Path, windowed: bool)
     scan_dir = scratch_root / scan_id
     video_path = scan_dir / "input.mp4"
     if not video_path.exists():
-        raise RuntimeError(f"Expected input video at {video_path} but it does not exist")
+        raise RuntimeError(f"Expected input video at {video_path}")
 
-    mode = "windowed" if windowed else "streaming"
+    windowed = (scan_type == "wand")
+
     cmd = [
         "python3.10",
         "/app/lingbot-map/demo.py",
         "--model_path", str(model_path),
         "--video_path", str(video_path),
         "--fps", "15",
-        "--mode", mode,
         "--keyframe_interval", "2",
         "--camera_num_iterations", "2",
         "--conf_threshold", "1.5",
     ]
+    # FIX 4: Only add --mode windowed for wand scans; streaming is the default
     if windowed:
-        cmd += ["--window_size", "128"]
+        cmd += ["--mode", "windowed", "--window_size", "128"]
 
-    _progress(job, f"Running LingBot-Map (mode={mode})...")
+    _progress(job, f"Running LingBot-Map (windowed={windowed})...")
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     print(proc.stdout)
 
     if proc.returncode != 0:
-        raise RuntimeError(f"lingbot-map demo.py failed with exit code {proc.returncode}")
+        raise RuntimeError(f"lingbot-map demo.py failed (exit {proc.returncode})")
 
     _progress(job, "Searching for .ply output...")
     return find_any_ply(scan_dir)
@@ -155,51 +190,52 @@ def handler(job: dict):
 
     inp = job.get("input") or {}
     scan_id = inp.get("scan_id")
-    callback_url = inp.get("callback_url")
 
     try:
         video_url = _require_input(inp, "video_url")
         scan_id = _require_input(inp, "scan_id")
-        callback_url = _require_input(inp, "callback_url")
-        windowed = bool(inp.get("windowed", False))
+        scan_type = inp.get("scan_type", "scope")  # 'scope' | 'wand'
+
+        # FIX 2: Look up patient_id so we can build the correct storage path
+        _progress(job, "Looking up patient_id...")
+        patient_id = get_patient_id(scan_id)
 
         scan_dir = scratch_root / scan_id
-
         _progress(job, "Creating scratch workspace...")
         scan_dir.mkdir(parents=True, exist_ok=True)
 
         video_path = scan_dir / "input.mp4"
-
         _progress(job, "Downloading input video...")
         download_file(video_url, video_path)
 
-        ply_path = run_lingbot_map(job, scan_id=scan_id, scratch_root=scratch_root, windowed=windowed)
+        ply_path = run_lingbot_map(job, scan_id=scan_id, scratch_root=scratch_root, scan_type=scan_type)
 
-        object_path = f"{scan_id}/pointcloud.ply"
+        # FIX 2: Upload to {patient_id}/{scan_id}/pointcloud.ply
+        # This matches the RLS policy: (storage.foldername(name))[1] = patient_id
+        object_path = f"{patient_id}/{scan_id}/pointcloud.ply"
 
         _progress(job, "Uploading .ply to Supabase Storage...")
         uploaded_path = upload_ply_to_supabase(ply_path, object_path)
 
-        callback_payload = {
+        _progress(job, "Done.")
+
+        # FIX 1: Return pointcloud_url (not ply_path) so reconstruct-scan-callback
+        #         can find it with pickPointCloudPath().
+        # FIX 3: Do NOT call post_callback() manually — the dispatcher already set
+        #         webhook=callbackUrl in the RunPod request, so RunPod's native
+        #         webhook delivers this return value automatically. A manual POST
+        #         would fire the callback twice.
+        return {
+            "pointcloud_url": uploaded_path,
             "scan_id": scan_id,
-            "ply_path": uploaded_path,
             "status": "completed",
         }
 
-        _progress(job, "Posting callback...")
-        post_callback(callback_url, callback_payload)
-
-        _progress(job, "Done.")
-        return {"output": callback_payload}
-
     except Exception as e:
         err_msg = str(e)
-        try:
-            if isinstance(callback_url, str) and callback_url and isinstance(scan_id, str) and scan_id:
-                _progress(job, "Error occurred; posting failure callback...")
-                post_callback(callback_url, {"scan_id": scan_id, "status": "failed", "error": err_msg})
-        except Exception:
-            pass
+        print(f"Handler error: {err_msg}")
+        # Return error — RunPod's webhook will deliver this to the callback
+        # which will mark the scan as failed.
         return {"error": err_msg}
 
     finally:
