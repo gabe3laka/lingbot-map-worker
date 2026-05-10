@@ -34,22 +34,11 @@ RUN python3.10 -m pip install \
 RUN git clone https://github.com/robbyant/lingbot-map /app/lingbot-map
 RUN python3.10 -m pip install -e /app/lingbot-map
 
-# Download model checkpoint at build time to /models
-RUN mkdir -p ${MODEL_DIR} && \
-    python3.10 - << 'PY' \
-from huggingface_hub import hf_hub_download \
-import os \
-repo_id = "robbyant/lingbot-map" \
-filename = "lingbot-map-long.pt" \
-local_dir = os.environ.get("MODEL_DIR", "/models") \
-hf_hub_download(repo_id=repo_id, filename=filename, local_dir=local_dir, local_dir_use_symlinks=False) \
-print("Downloaded", filename, "to", local_dir) \
-PY
+# Model checkpoint is downloaded at runtime by rp_handler.py
+# using HF_TOKEN env var set in RunPod endpoint settings.
+RUN mkdir -p /models /scratch
 
 # Handler
 COPY rp_handler.py /app/rp_handler.py
-
-# Scratch root (jobs create /scratch/{scan_id})
-RUN mkdir -p /scratch
 
 CMD ["python3.10", "-u", "/app/rp_handler.py"]
