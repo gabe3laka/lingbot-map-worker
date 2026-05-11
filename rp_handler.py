@@ -123,16 +123,22 @@ def upload_ply_to_supabase(file_path: Path, object_path: str) -> str:
 
 def unproject_depth_to_world(depth, extrinsic, intrinsic):
     """
-    Unproject per-pixel depth into 3-D world-space points using the camera
-    intrinsics and extrinsics produced by postprocess().
+    Unproject per-pixel depth into 3-D world-space points.
+
+    Based on gct_base.py::_unproject_depth_to_world from lingbot-map.
+
+    LingBot-Map's depth head outputs shape (B, S, H, W, 1) — i.e. there is a
+    trailing channel dimension. After postprocess() squeezes the batch dim (B=1),
+    depth arrives here as (N, H, W, 1). We squeeze the trailing 1 before
+    computing to get (N, H, W).
 
     Args:
-        depth      : (N, H, W)   metric per-pixel depth (numpy or torch)
-        extrinsic  : (N, 3, 4)   camera-to-world transform  (c2w)
-        intrinsic  : (N, 3, 3)   camera intrinsic matrix
+        depth     : (N, H, W) or (N, H, W, 1) — metric depth, numpy or torch
+        extrinsic : (N, 3, 4) — camera-to-world (c2w), numpy or torch
+        intrinsic : (N, 3, 3) — camera intrinsic matrix, numpy or torch
 
     Returns:
-        world_points : (N, H, W, 3)  float32 numpy array
+        world_points : (N, H, W, 3) float32 numpy array
     """
     if isinstance(depth, torch.Tensor):
         depth = depth.detach().cpu().float().numpy()
@@ -141,31 +147,49 @@ def unproject_depth_to_world(depth, extrinsic, intrinsic):
     if isinstance(intrinsic, torch.Tensor):
         intrinsic = intrinsic.detach().cpu().float().numpy()
 
-    depth = depth.astype(np.float32)
+    depth     = depth.astype(np.float32)
     extrinsic = extrinsic.astype(np.float32)
     intrinsic = intrinsic.astype(np.float32)
 
-    N, H, W = depth.shape
+    # ── Normalise depth shape to (N, H, W) ──────────────────────────────
+    # gct_base forward docstring: depth is [B, S, H, W, 1].
+    # After _squeeze_single_batch removes B=1 → (N, H, W, 1).
+    # Squeeze the trailing channel dim if present.
+    if depth.ndim == 4 and depth.shape[-1] == 1:
+        depth = depth[..., 0]           # (N, H, W, 1) → (N, H, W)
+    elif depth.ndim == 4 and depth.shape[1] == 1:
+        depth = depth[:, 0, :, :]       # (N, 1, H, W) → (N, H, W)  (channels-first fallback)
 
-    # Pixel grid: (H, W, 3) homogeneous pixel coords [u, v, 1]
+    if depth.ndim != 3:
+        raise RuntimeError(
+            f"Cannot reduce depth to (N, H, W): got shape {depth.shape}"
+        )
+
+    N, H, W = depth.shape
+    print(f"  unproject: depth={depth.shape}, extrinsic={extrinsic.shape}, intrinsic={intrinsic.shape}")
+
+    # ── Pixel grid: (H, W, 3) homogeneous coords [u, v, 1] ─────────────
     v_idx, u_idx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
     pix = np.stack([u_idx, v_idx, np.ones((H, W), dtype=np.float32)], axis=-1)  # (H, W, 3)
 
-    # Inverse intrinsics per frame: (N, 3, 3)
-    K_inv = np.linalg.inv(intrinsic)
+    # ── K^{-1} per frame: (N, 3, 3) ─────────────────────────────────────
+    K_inv = np.linalg.inv(intrinsic)   # (N, 3, 3)
 
-    # Camera-space rays: (N, H, W, 3)  =  K^{-1} @ [u, v, 1]^T
+    # ── Camera-space rays: (N, H, W, 3) = K^{-1} @ [u, v, 1]^T ─────────
     cam_rays = np.einsum("nij,hwj->nhwi", K_inv, pix)
 
-    # Scale by depth to get camera-frame 3-D points: (N, H, W, 3)
+    # ── Scale by depth → camera-frame 3-D points: (N, H, W, 3) ─────────
     cam_pts = cam_rays * depth[..., np.newaxis]
 
-    # Rotate + translate into world space: P_w = R @ P_c + t
-    R = extrinsic[:, :3, :3]   # (N, 3, 3)
-    t = extrinsic[:, :3, 3]    # (N, 3)
-    world = np.einsum("nij,nhwj->nhwi", R, cam_pts) + t[:, np.newaxis, np.newaxis, :]
+    # ── Rotate + translate into world space: P_w = R @ P_c + t ──────────
+    R = extrinsic[:, :3, :3]           # (N, 3, 3)
+    t = extrinsic[:, :3, 3]            # (N, 3)
+    world = (
+        np.einsum("nij,nhwj->nhwi", R, cam_pts)
+        + t[:, np.newaxis, np.newaxis, :]
+    )
 
-    return world.astype(np.float32)
+    return world.astype(np.float32)    # (N, H, W, 3)
 
 def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
     """
@@ -176,15 +200,12 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
       2. Model emits 'depth' + 'extrinsic' + 'intrinsic' (current streaming
          path) — we unproject depth into world space ourselves.
 
-    predictions must contain one of:
-      - world_points: (N, H, W, 3) or (N, 3, H, W)
-      OR
-      - depth: (N, H, W)  +  extrinsic: (N, 3, 4)  +  intrinsic: (N, 3, 3)
-        (all added by postprocess() before this function is called)
-
-    Optional keys used if present:
-      - world_points_conf / depth_conf : (N, H, W) confidence map
-      - images : (N, 3, H, W) float in [0, 1] for per-point colour
+    Key shape notes from gct_base.py forward() docstring:
+      depth          : (B, S, H, W, 1)  → after _squeeze_single_batch: (N, H, W, 1)
+      depth_conf     : (B, S, H, W)     → after squeeze:               (N, H, W)
+      extrinsic      : (B, S, 3, 4)     → after squeeze:               (N, 3, 4)  c2w
+      intrinsic      : (B, S, 3, 3)     → after squeeze:               (N, 3, 3)
+      images         : (B, S, 3, H, W)  → after squeeze:               (N, 3, H, W)
     """
     import open3d as o3d
 
@@ -193,8 +214,13 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
         pts = predictions["world_points"]
         if isinstance(pts, torch.Tensor):
             pts = pts.detach().cpu().float().numpy()
-        if pts.shape[-1] != 3:          # (N, 3, H, W) -> (N, H, W, 3)
-            pts = pts.transpose(0, 2, 3, 1)
+        # world_points from model: (B, S, H, W, 3) → squeeze → (N, H, W, 3)
+        # or channel-first (N, 3, H, W) — handle both
+        if pts.ndim == 4 and pts.shape[-1] == 3:
+            pass                            # already (N, H, W, 3)
+        elif pts.ndim == 4 and pts.shape[1] == 3:
+            pts = pts.transpose(0, 2, 3, 1) # (N, 3, H, W) → (N, H, W, 3)
+        print(f"Using world_points from model, shape: {pts.shape}")
     else:
         if "depth" not in predictions:
             raise RuntimeError(
@@ -207,13 +233,16 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
                 "Make sure postprocess() was called before export_ply()."
             )
         print("world_points not in predictions — unprojecting from depth + extrinsic + intrinsic")
-        pts = unproject_depth_to_world(
-            predictions["depth"],
-            predictions["extrinsic"],
-            predictions["intrinsic"],
-        )
+        # Log shapes to help debug any future issues
+        d = predictions["depth"]
+        e = predictions["extrinsic"]
+        i = predictions["intrinsic"]
+        print(f"  depth shape  : {d.shape if hasattr(d, 'shape') else type(d)}")
+        print(f"  extrinsic    : {e.shape if hasattr(e, 'shape') else type(e)}")
+        print(f"  intrinsic    : {i.shape if hasattr(i, 'shape') else type(i)}")
+        pts = unproject_depth_to_world(d, e, i)   # → (N, H, W, 3)
 
-    pts_flat = pts.reshape(-1, 3)   # (N*H*W, 3)
+    pts_flat = pts.reshape(-1, 3)                 # (N*H*W, 3)
 
     # ── Confidence mask ──────────────────────────────────────────────────
     conf_key = (
@@ -225,13 +254,15 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
         conf = predictions[conf_key]
         if isinstance(conf, torch.Tensor):
             conf = conf.detach().cpu().float().numpy()
+        # depth_conf shape after squeeze: (N, H, W) — already flat-compatible
+        print(f"  conf ({conf_key}) shape: {conf.shape}")
         mask = conf.reshape(-1) >= conf_threshold
     else:
         mask = np.ones(pts_flat.shape[0], dtype=bool)
 
-    # Drop NaN / Inf pixels (common at sky, edges, textureless regions)
+    # Drop NaN / Inf pixels (sky, edges, textureless regions)
     finite = np.isfinite(pts_flat).all(axis=-1)
-    mask = mask & finite
+    mask   = mask & finite
     pts_flat = pts_flat[mask]
 
     # ── Colour from images tensor ────────────────────────────────────────
@@ -240,7 +271,8 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
         imgs = predictions["images"]
         if isinstance(imgs, torch.Tensor):
             imgs = imgs.detach().cpu().float().numpy()
-        if imgs.shape[1] == 3:          # (N, 3, H, W) -> (N, H, W, 3)
+        # images shape after squeeze: (N, 3, H, W) → (N, H, W, 3)
+        if imgs.ndim == 4 and imgs.shape[1] == 3:
             imgs = imgs.transpose(0, 2, 3, 1)
         colours_flat = imgs.reshape(-1, 3)[mask]
         colours = np.clip(colours_flat, 0.0, 1.0)
@@ -266,7 +298,7 @@ def run_lingbot_map(job: dict, scan_id: str, scan_dir: Path, scan_type: str) -> 
     if str(lingbot_map_root) not in sys.path:
         sys.path.insert(0, str(lingbot_map_root))
 
-    model_dir = os.getenv("MODEL_DIR", "/models")
+    model_dir  = os.getenv("MODEL_DIR",  "/models")
     model_file = os.getenv("MODEL_FILE", "lingbot-map-long.pt")
     model_path = Path(model_dir) / model_file
     if not model_path.exists():
@@ -277,7 +309,7 @@ def run_lingbot_map(job: dict, scan_id: str, scan_dir: Path, scan_type: str) -> 
         raise RuntimeError(f"Expected input video at {video_path}")
 
     windowed = (scan_type == "wand")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ── Import demo helpers from lingbot-map ────────────────────────────
     from demo import load_images, load_model, postprocess
@@ -325,7 +357,7 @@ def run_lingbot_map(job: dict, scan_id: str, scan_dir: Path, scan_type: str) -> 
     else:
         dtype = torch.float32
 
-    images = images.to(device)
+    images     = images.to(device)
     num_frames = images.shape[0]
     print(f"Input: {num_frames} frames, shape {tuple(images.shape)}, mode={args.mode}")
 
@@ -359,6 +391,11 @@ def run_lingbot_map(job: dict, scan_id: str, scan_dir: Path, scan_type: str) -> 
     images_for_post = predictions.get("images", images)
     predictions, images_cpu = postprocess(predictions, images_for_post)
 
+    # Log post-process output shapes to help diagnose any remaining issues
+    for k, v in predictions.items():
+        shape = v.shape if hasattr(v, "shape") else type(v)
+        print(f"  post-process key={k!r}  shape={shape}")
+
     # Attach images for colour export
     if "images" not in predictions:
         predictions["images"] = images_cpu
@@ -374,9 +411,9 @@ def run_lingbot_map(job: dict, scan_id: str, scan_dir: Path, scan_type: str) -> 
 # ----------------------------
 def handler(job: dict):
     scratch_root = Path("/scratch")
-    scan_dir = None
+    scan_dir     = None
 
-    inp = job.get("input") or {}
+    inp     = job.get("input") or {}
     scan_id = inp.get("scan_id")
 
     try:
@@ -410,13 +447,15 @@ def handler(job: dict):
 
         return {
             "pointcloud_url": uploaded_path,
-            "scan_id": scan_id,
-            "status": "completed",
+            "scan_id":        scan_id,
+            "status":         "completed",
         }
 
     except Exception as e:
         err_msg = str(e)
         print(f"Handler error: {err_msg}")
+        import traceback
+        traceback.print_exc()
         return {"error": err_msg}
 
     finally:
