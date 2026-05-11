@@ -316,12 +316,13 @@ def run_lingbot_map(job: dict, scan_id: str, scan_dir: Path, scan_type: str) -> 
 
     # ── Load frames ──────────────────────────────────────────────────────
     _progress(job, "Extracting frames from video...")
-    images, paths, resolved_folder = load_images(
+    load_result = load_images(
         video_path=str(video_path),
         fps=15,
         image_size=518,
         patch_size=14,
     )
+    images, paths, resolved_folder = load_result[0], load_result[1], load_result[2]
 
     # ── Build a minimal args namespace for load_model ────────────────────
     import argparse
