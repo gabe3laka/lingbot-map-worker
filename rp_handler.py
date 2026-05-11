@@ -121,44 +121,126 @@ def upload_ply_to_supabase(file_path: Path, object_path: str) -> str:
     resp.raise_for_status()
     return object_path
 
+def unproject_depth_to_world(depth, extrinsic, intrinsic):
+    """
+    Unproject per-pixel depth into 3-D world-space points using the camera
+    intrinsics and extrinsics produced by postprocess().
+
+    Args:
+        depth      : (N, H, W)   metric per-pixel depth (numpy or torch)
+        extrinsic  : (N, 3, 4)   camera-to-world transform  (c2w)
+        intrinsic  : (N, 3, 3)   camera intrinsic matrix
+
+    Returns:
+        world_points : (N, H, W, 3)  float32 numpy array
+    """
+    if isinstance(depth, torch.Tensor):
+        depth = depth.detach().cpu().float().numpy()
+    if isinstance(extrinsic, torch.Tensor):
+        extrinsic = extrinsic.detach().cpu().float().numpy()
+    if isinstance(intrinsic, torch.Tensor):
+        intrinsic = intrinsic.detach().cpu().float().numpy()
+
+    depth = depth.astype(np.float32)
+    extrinsic = extrinsic.astype(np.float32)
+    intrinsic = intrinsic.astype(np.float32)
+
+    N, H, W = depth.shape
+
+    # Pixel grid: (H, W, 3) homogeneous pixel coords [u, v, 1]
+    v_idx, u_idx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    pix = np.stack([u_idx, v_idx, np.ones((H, W), dtype=np.float32)], axis=-1)  # (H, W, 3)
+
+    # Inverse intrinsics per frame: (N, 3, 3)
+    K_inv = np.linalg.inv(intrinsic)
+
+    # Camera-space rays: (N, H, W, 3)  =  K^{-1} @ [u, v, 1]^T
+    cam_rays = np.einsum("nij,hwj->nhwi", K_inv, pix)
+
+    # Scale by depth to get camera-frame 3-D points: (N, H, W, 3)
+    cam_pts = cam_rays * depth[..., np.newaxis]
+
+    # Rotate + translate into world space: P_w = R @ P_c + t
+    R = extrinsic[:, :3, :3]   # (N, 3, 3)
+    t = extrinsic[:, :3, 3]    # (N, 3)
+    world = np.einsum("nij,nhwj->nhwi", R, cam_pts) + t[:, np.newaxis, np.newaxis, :]
+
+    return world.astype(np.float32)
+
 def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
     """
     Build a .ply point cloud from LingBot-Map model output tensors.
 
-    predictions must contain at least:
-      - world_points: (N, H, W, 3) or (N, 3, H, W) float tensor
-      - world_points_conf: (N, H, W) float tensor  [optional]
-      - images: (N, 3, H, W) float tensor in [0,1]  [optional, for colour]
+    Handles two cases:
+      1. Model emits 'world_points' directly (future / alternate config).
+      2. Model emits 'depth' + 'extrinsic' + 'intrinsic' (current streaming
+         path) — we unproject depth into world space ourselves.
+
+    predictions must contain one of:
+      - world_points: (N, H, W, 3) or (N, 3, H, W)
+      OR
+      - depth: (N, H, W)  +  extrinsic: (N, 3, 4)  +  intrinsic: (N, 3, 3)
+        (all added by postprocess() before this function is called)
+
+    Optional keys used if present:
+      - world_points_conf / depth_conf : (N, H, W) confidence map
+      - images : (N, 3, H, W) float in [0, 1] for per-point colour
     """
     import open3d as o3d
 
-    # Support both (N, H, W, 3) and (N, 3, H, W) layouts
-    pts = predictions["world_points"]
-    if isinstance(pts, torch.Tensor):
-        pts = pts.detach().cpu().float().numpy()
-    if pts.shape[-1] != 3:          # (N, 3, H, W) -> (N, H, W, 3)
-        pts = pts.transpose(0, 2, 3, 1)
+    # ── Obtain (N, H, W, 3) world points ────────────────────────────────
+    if "world_points" in predictions:
+        pts = predictions["world_points"]
+        if isinstance(pts, torch.Tensor):
+            pts = pts.detach().cpu().float().numpy()
+        if pts.shape[-1] != 3:          # (N, 3, H, W) -> (N, H, W, 3)
+            pts = pts.transpose(0, 2, 3, 1)
+    else:
+        if "depth" not in predictions:
+            raise RuntimeError(
+                f"predictions has neither 'world_points' nor 'depth'. "
+                f"Keys present: {list(predictions.keys())}"
+            )
+        if "extrinsic" not in predictions or "intrinsic" not in predictions:
+            raise RuntimeError(
+                "predictions missing 'extrinsic' and/or 'intrinsic'. "
+                "Make sure postprocess() was called before export_ply()."
+            )
+        print("world_points not in predictions — unprojecting from depth + extrinsic + intrinsic")
+        pts = unproject_depth_to_world(
+            predictions["depth"],
+            predictions["extrinsic"],
+            predictions["intrinsic"],
+        )
+
     pts_flat = pts.reshape(-1, 3)   # (N*H*W, 3)
 
-    # Confidence mask
-    if "world_points_conf" in predictions:
-        conf = predictions["world_points_conf"]
+    # ── Confidence mask ──────────────────────────────────────────────────
+    conf_key = (
+        "world_points_conf" if "world_points_conf" in predictions
+        else "depth_conf"   if "depth_conf"        in predictions
+        else None
+    )
+    if conf_key is not None:
+        conf = predictions[conf_key]
         if isinstance(conf, torch.Tensor):
             conf = conf.detach().cpu().float().numpy()
         mask = conf.reshape(-1) >= conf_threshold
     else:
         mask = np.ones(pts_flat.shape[0], dtype=bool)
 
+    # Drop NaN / Inf pixels (common at sky, edges, textureless regions)
+    finite = np.isfinite(pts_flat).all(axis=-1)
+    mask = mask & finite
     pts_flat = pts_flat[mask]
 
-    # Colour from images tensor
+    # ── Colour from images tensor ────────────────────────────────────────
     colours = None
     if "images" in predictions:
         imgs = predictions["images"]
         if isinstance(imgs, torch.Tensor):
             imgs = imgs.detach().cpu().float().numpy()
-        # (N, 3, H, W) -> (N, H, W, 3)
-        if imgs.shape[1] == 3:
+        if imgs.shape[1] == 3:          # (N, 3, H, W) -> (N, H, W, 3)
             imgs = imgs.transpose(0, 2, 3, 1)
         colours_flat = imgs.reshape(-1, 3)[mask]
         colours = np.clip(colours_flat, 0.0, 1.0)
@@ -299,7 +381,7 @@ def handler(job: dict):
 
     try:
         video_url = _require_input(inp, "video_url")
-        scan_id = _require_input(inp, "scan_id")
+        scan_id   = _require_input(inp, "scan_id")
         scan_type = inp.get("scan_type", "scope")  # 'scope' | 'wand'
 
         _progress(job, "Looking up patient_id...")
