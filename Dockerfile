@@ -32,7 +32,8 @@ RUN python3.10 -m pip install \
     open3d
 
 # Clone & install LingBot-Map
-RUN git clone https://github.com/robbyant/lingbot-map /app/lingbot-map
+RUN git clone https://github.com/robbyant/lingbot-map /app/lingbot-map && \
+    cd /app/lingbot-map && git checkout 8db50df
 RUN python3.10 -m pip install -e /app/lingbot-map
 
 # Model checkpoint is downloaded at runtime by rp_handler.py
