@@ -456,7 +456,10 @@ def handler(job: dict):
         print(f"Handler error: {err_msg}")
         import traceback
         traceback.print_exc()
-        return {"error": err_msg}
+        # Re-raise so RunPod marks the job as FAILED (status=FAILED in webhook).
+        # Returning {"error": ...} would mark it COMPLETED with missing pointcloud_url,
+        # causing the callback to silently mark the scan as failed without the real error.
+        raise
 
     finally:
         if scan_dir and scan_dir.exists():
