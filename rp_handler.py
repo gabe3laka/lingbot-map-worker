@@ -59,6 +59,13 @@ def _require_env(name: str) -> str:
         raise RuntimeError(f"Missing required env var: {name}")
     return v
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var. Accepts 1/0, true/false, yes/no, on/off (case-insensitive)."""
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
 def _progress(job: dict, msg: str):
     try:
         runpod.serverless.progress_update(job, msg)
@@ -191,7 +198,7 @@ def unproject_depth_to_world(depth, extrinsic, intrinsic):
 
     return world.astype(np.float32)    # (N, H, W, 3)
 
-def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
+def export_ply(predictions: dict, ply_path: Path, conf_threshold: float | None = None):
     """
     Build a .ply point cloud from LingBot-Map model output tensors.
 
@@ -199,6 +206,15 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
       1. Model emits 'world_points' directly (future / alternate config).
       2. Model emits 'depth' + 'extrinsic' + 'intrinsic' (current streaming
          path) — we unproject depth into world space ourselves.
+
+    Output PLY is kept small to fit under Supabase Free Plan's 50 MB upload cap
+    via float32 casting, voxel downsampling, and an optional point cap.
+    Tunable via env vars (all optional):
+        PLY_CONF_THRESHOLD  (float, default 1.5)    confidence cutoff
+        PLY_VOXEL_SIZE_M    (float, default 0.002)  voxel size in metres; <=0 disables
+        PLY_MAX_POINTS      (int,   default 2_000_000) hard cap on points; <=0 disables
+        PLY_WRITE_ASCII     (bool,  default false)  write ASCII PLY instead of binary
+        PLY_COMPRESSED      (bool,  default false)  ask Open3D to compress on write
 
     Key shape notes from gct_base.py forward() docstring:
       depth          : (B, S, H, W, 1)  → after _squeeze_single_batch: (N, H, W, 1)
@@ -209,6 +225,19 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
     """
     import open3d as o3d
 
+    # ── Env-driven knobs ────────────────────────────────────────────────
+    if conf_threshold is None:
+        conf_threshold = float(os.getenv("PLY_CONF_THRESHOLD", "1.5"))
+    voxel_size_m = float(os.getenv("PLY_VOXEL_SIZE_M", "0.002"))
+    max_points = int(os.getenv("PLY_MAX_POINTS", "2000000"))
+    write_ascii = _env_bool("PLY_WRITE_ASCII", False)
+    compressed = _env_bool("PLY_COMPRESSED", False)
+    print(
+        f"export_ply config: conf_threshold={conf_threshold}, "
+        f"voxel_size_m={voxel_size_m}, max_points={max_points}, "
+        f"write_ascii={write_ascii}, compressed={compressed}"
+    )
+
     # ── Obtain (N, H, W, 3) world points ────────────────────────────────
     if "world_points" in predictions:
         pts = predictions["world_points"]
@@ -217,9 +246,9 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
         # world_points from model: (B, S, H, W, 3) → squeeze → (N, H, W, 3)
         # or channel-first (N, 3, H, W) — handle both
         if pts.ndim == 4 and pts.shape[-1] == 3:
-            pass                            # already (N, H, W, 3)
+            pass  # already (N, H, W, 3)
         elif pts.ndim == 4 and pts.shape[1] == 3:
-            pts = pts.transpose(0, 2, 3, 1) # (N, 3, H, W) → (N, H, W, 3)
+            pts = pts.transpose(0, 2, 3, 1)  # (N, 3, H, W) → (N, H, W, 3)
         print(f"Using world_points from model, shape: {pts.shape}")
     else:
         if "depth" not in predictions:
@@ -234,20 +263,20 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
             )
         print("world_points not in predictions — unprojecting from depth + extrinsic + intrinsic")
         # Log shapes to help debug any future issues
-        d = predictions["depth"]
-        e = predictions["extrinsic"]
-        i = predictions["intrinsic"]
-        print(f"  depth shape  : {d.shape if hasattr(d, 'shape') else type(d)}")
-        print(f"  extrinsic    : {e.shape if hasattr(e, 'shape') else type(e)}")
-        print(f"  intrinsic    : {i.shape if hasattr(i, 'shape') else type(i)}")
-        pts = unproject_depth_to_world(d, e, i)   # → (N, H, W, 3)
+        d_ = predictions["depth"]
+        e_ = predictions["extrinsic"]
+        i_ = predictions["intrinsic"]
+        print(f"  depth shape  : {d_.shape if hasattr(d_, 'shape') else type(d_)}")
+        print(f"  extrinsic    : {e_.shape if hasattr(e_, 'shape') else type(e_)}")
+        print(f"  intrinsic    : {i_.shape if hasattr(i_, 'shape') else type(i_)}")
+        pts = unproject_depth_to_world(d_, e_, i_)  # → (N, H, W, 3)
 
-    pts_flat = pts.reshape(-1, 3)                 # (N*H*W, 3)
+    pts_flat = pts.reshape(-1, 3).astype(np.float32, copy=False)  # (N*H*W, 3)
 
     # ── Confidence mask ──────────────────────────────────────────────────
     conf_key = (
         "world_points_conf" if "world_points_conf" in predictions
-        else "depth_conf"   if "depth_conf"        in predictions
+        else "depth_conf" if "depth_conf" in predictions
         else None
     )
     if conf_key is not None:
@@ -262,7 +291,7 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
 
     # Drop NaN / Inf pixels (sky, edges, textureless regions)
     finite = np.isfinite(pts_flat).all(axis=-1)
-    mask   = mask & finite
+    mask = mask & finite
     pts_flat = pts_flat[mask]
 
     # ── Colour from images tensor ────────────────────────────────────────
@@ -274,18 +303,40 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float = 1.5):
         # images shape after squeeze: (N, 3, H, W) → (N, H, W, 3)
         if imgs.ndim == 4 and imgs.shape[1] == 3:
             imgs = imgs.transpose(0, 2, 3, 1)
-        colours_flat = imgs.reshape(-1, 3)[mask]
+        colours_flat = imgs.reshape(-1, 3).astype(np.float32, copy=False)[mask]
         colours = np.clip(colours_flat, 0.0, 1.0)
 
-    print(f"Writing {len(pts_flat):,} points to {ply_path}")
+    print(f"Built point cloud: {len(pts_flat):,} points before downsample")
+
+    # ── Build Open3D point cloud (float64 required by Open3D internals) ──
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts_flat.astype(np.float64))
     if colours is not None:
         pcd.colors = o3d.utility.Vector3dVector(colours.astype(np.float64))
 
+    # ── Voxel downsample (uniform spatial decimation) ────────────────────
+    if voxel_size_m and voxel_size_m > 0:
+        before = len(pcd.points)
+        pcd = pcd.voxel_down_sample(voxel_size=voxel_size_m)
+        print(f"voxel_down_sample(voxel_size={voxel_size_m} m): {before:,} → {len(pcd.points):,} points")
+
+    # ── Hard cap via uniform_down_sample if still too dense ──────────────
+    if max_points and max_points > 0 and len(pcd.points) > max_points:
+        every_k = int(np.ceil(len(pcd.points) / max_points))
+        before = len(pcd.points)
+        pcd = pcd.uniform_down_sample(every_k_points=every_k)
+        print(f"uniform_down_sample(every_k_points={every_k}): {before:,} → {len(pcd.points):,} points (cap={max_points:,})")
+
+    print(f"Writing {len(pcd.points):,} points to {ply_path}")
     ply_path.parent.mkdir(parents=True, exist_ok=True)
-    o3d.io.write_point_cloud(str(ply_path), pcd)
-    print(f"PLY saved: {ply_path}  ({ply_path.stat().st_size / 1024:.1f} KB)")
+    o3d.io.write_point_cloud(
+        str(ply_path),
+        pcd,
+        write_ascii=write_ascii,
+        compressed=compressed,
+    )
+    size_kb = ply_path.stat().st_size / 1024
+    print(f"PLY saved: {ply_path} ({size_kb:.1f} KB / {size_kb/1024:.2f} MB)")
     return ply_path
 
 def run_lingbot_map(job: dict, scan_id: str, scan_dir: Path, scan_type: str) -> Path:
