@@ -232,10 +232,19 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float | None =
     max_points = int(os.getenv("PLY_MAX_POINTS", "2000000"))
     write_ascii = _env_bool("PLY_WRITE_ASCII", False)
     compressed = _env_bool("PLY_COMPRESSED", False)
+    # New knobs (Tier B + Tier D)
+    outlier_removal = _env_bool("PLY_OUTLIER_REMOVAL", True)
+    outlier_nb_neighbors = int(os.getenv("PLY_OUTLIER_NB_NEIGHBORS", "20"))
+    outlier_std_ratio = float(os.getenv("PLY_OUTLIER_STD_RATIO", "2.0"))
+    auto_orient = _env_bool("PLY_AUTO_ORIENT", True)
     print(
         f"export_ply config: conf_threshold={conf_threshold}, "
         f"voxel_size_m={voxel_size_m}, max_points={max_points}, "
-        f"write_ascii={write_ascii}, compressed={compressed}"
+        f"write_ascii={write_ascii}, compressed={compressed}, "
+        f"outlier_removal={outlier_removal}, "
+        f"outlier_nb_neighbors={outlier_nb_neighbors}, "
+        f"outlier_std_ratio={outlier_std_ratio}, "
+        f"auto_orient={auto_orient}"
     )
 
     # ── Obtain (N, H, W, 3) world points ────────────────────────────────
@@ -326,6 +335,48 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float | None =
         before = len(pcd.points)
         pcd = pcd.uniform_down_sample(every_k_points=every_k)
         print(f"uniform_down_sample(every_k_points={every_k}): {before:,} → {len(pcd.points):,} points (cap={max_points:,})")
+
+    # ── Statistical outlier removal (Tier B) ─────────────────────
+    # Strips speckle "floater" points whose mean distance to their nearest
+    # neighbors is more than std_ratio standard deviations above the global
+    # mean — i.e. points sitting in empty space far from any surface.
+    if outlier_removal and len(pcd.points) > outlier_nb_neighbors:
+        before = len(pcd.points)
+        pcd, _ = pcd.remove_statistical_outlier(
+            nb_neighbors=outlier_nb_neighbors,
+            std_ratio=outlier_std_ratio,
+        )
+        print(
+            f"statistical_outlier_removal(nb_neighbors={outlier_nb_neighbors}, "
+            f"std_ratio={outlier_std_ratio}): {before:,} → {len(pcd.points):,} points"
+        )
+
+    # ── PCA auto-orientation (Tier D) ────────────────────────
+    # Rotate the cloud so its dominant plane (the floor / table / largest flat
+    # surface) lies on world Y=0 with normal pointing up. Purely a viewing
+    # convenience — does not change relative geometry.
+    if auto_orient and len(pcd.points) >= 3:
+        pts_np = np.asarray(pcd.points)
+        centroid = pts_np.mean(axis=0)
+        centred = pts_np - centroid
+        _, _, vh = np.linalg.svd(centred, full_matrices=False)
+        normal = vh[-1]
+        target = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        v = np.cross(normal, target)
+        s = np.linalg.norm(v)
+        c = float(np.dot(normal, target))
+        if s < 1e-8:
+            R = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+        else:
+            vx = np.array([
+                [0.0, -v[2], v[1]],
+                [v[2], 0.0, -v[0]],
+                [-v[1], v[0], 0.0],
+            ])
+            R = np.eye(3) + vx + vx @ vx * ((1.0 - c) / (s * s))
+        rotated = (centred @ R.T) + centroid
+        pcd.points = o3d.utility.Vector3dVector(rotated)
+        print(f"auto_orient: rotated cloud so dominant plane normal → +Y")
 
     print(f"Writing {len(pcd.points):,} points to {ply_path}")
     ply_path.parent.mkdir(parents=True, exist_ok=True)
