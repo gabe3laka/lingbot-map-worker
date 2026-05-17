@@ -198,7 +198,7 @@ def unproject_depth_to_world(depth, extrinsic, intrinsic):
 
     return world.astype(np.float32)    # (N, H, W, 3)
 
-def export_ply(predictions: dict, ply_path: Path, conf_threshold: float | None = None):
+def export_ply(predictions: dict, ply_path: Path, conf_threshold: float | None = None, job: dict | None = None):
     """
     Build a .ply point cloud from LingBot-Map model output tensors.
 
@@ -237,6 +237,29 @@ def export_ply(predictions: dict, ply_path: Path, conf_threshold: float | None =
     outlier_nb_neighbors = int(os.getenv("PLY_OUTLIER_NB_NEIGHBORS", "20"))
     outlier_std_ratio = float(os.getenv("PLY_OUTLIER_STD_RATIO", "2.0"))
     auto_orient = _env_bool("PLY_AUTO_ORIENT", True)
+
+    # ── Per-job PLY overrides (job payload > env var > default) ──
+    if isinstance(job, dict):
+        _ply_ov = (job.get("input") or {}).get("ply") or {}
+        if "conf_threshold" in _ply_ov and _ply_ov["conf_threshold"] is not None:
+            try: conf_threshold = float(_ply_ov["conf_threshold"])
+            except (ValueError, TypeError): pass
+        if "voxel_size_m" in _ply_ov and _ply_ov["voxel_size_m"] is not None:
+            try: voxel_size_m = float(_ply_ov["voxel_size_m"])
+            except (ValueError, TypeError): pass
+        if "max_points" in _ply_ov and _ply_ov["max_points"] is not None:
+            try: max_points = int(_ply_ov["max_points"])
+            except (ValueError, TypeError): pass
+        if "outlier_removal" in _ply_ov and _ply_ov["outlier_removal"] is not None:
+            outlier_removal = bool(_ply_ov["outlier_removal"])
+        if "outlier_nb_neighbors" in _ply_ov and _ply_ov["outlier_nb_neighbors"] is not None:
+            try: outlier_nb_neighbors = int(_ply_ov["outlier_nb_neighbors"])
+            except (ValueError, TypeError): pass
+        if "outlier_std_ratio" in _ply_ov and _ply_ov["outlier_std_ratio"] is not None:
+            try: outlier_std_ratio = float(_ply_ov["outlier_std_ratio"])
+            except (ValueError, TypeError): pass
+        if "auto_orient" in _ply_ov and _ply_ov["auto_orient"] is not None:
+            auto_orient = bool(_ply_ov["auto_orient"])
     print(
         f"export_ply config: conf_threshold={conf_threshold}, "
         f"voxel_size_m={voxel_size_m}, max_points={max_points}, "
@@ -410,8 +433,41 @@ def run_lingbot_map(job: dict, scan_id: str, scan_dir: Path, scan_type: str) -> 
     if not video_path.exists():
         raise RuntimeError(f"Expected input video at {video_path}")
 
-    windowed = (scan_type == "wand")
     device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ── Resolve LingBot knobs: job payload > env var > scan_type default ──
+    job_input = (job.get("input") or {}) if isinstance(job, dict) else {}
+    lb_overrides = job_input.get("lingbot") or {}
+
+    def _lb(key, default):
+        if key in lb_overrides and lb_overrides[key] is not None:
+            return lb_overrides[key]
+        env_val = os.getenv("LINGBOT_" + key.upper())
+        if env_val is not None and env_val != "":
+            try:
+                if isinstance(default, bool):
+                    return env_val.strip().lower() in ("1", "true", "yes", "on")
+                if isinstance(default, int):
+                    return int(env_val)
+                if isinstance(default, float):
+                    return float(env_val)
+                return env_val
+            except (ValueError, TypeError):
+                return default
+        return default
+
+    # scan_type defaults: scope/mouth = streaming, wand/room = windowed
+    is_wand = (scan_type == "wand")
+    lb_mode               = _lb("mode", "windowed" if is_wand else "streaming")
+    lb_fps                = _lb("fps", 10 if is_wand else 8)
+    lb_camera_iterations  = _lb("camera_iterations", 4)
+    lb_keyframe_interval  = _lb("keyframe_interval", 2)
+    lb_overlap_keyframes  = _lb("overlap_keyframes", 16)
+    lb_window_size        = _lb("window_size", 128)
+
+    print(f"[lingbot] scan_type={scan_type} mode={lb_mode} fps={lb_fps} "
+          f"camera_iter={lb_camera_iterations} kf_interval={lb_keyframe_interval} "
+          f"overlap_kf={lb_overlap_keyframes} window={lb_window_size}")
 
     # ── Import demo helpers from lingbot-map ────────────────────────────
     from demo import load_images, load_model, postprocess
@@ -420,7 +476,7 @@ def run_lingbot_map(job: dict, scan_id: str, scan_dir: Path, scan_type: str) -> 
     _progress(job, "Extracting frames from video...")
     load_result = load_images(
         video_path=str(video_path),
-        fps=15,
+        fps=lb_fps,
         image_size=518,
         patch_size=14,
     )
@@ -429,7 +485,7 @@ def run_lingbot_map(job: dict, scan_id: str, scan_dir: Path, scan_type: str) -> 
     # ── Build a minimal args namespace for load_model ────────────────────
     import argparse
     args = argparse.Namespace(
-        mode="windowed" if windowed else "streaming",
+        mode=lb_mode,
         image_size=518,
         patch_size=14,
         enable_3d_rope=True,
@@ -439,12 +495,12 @@ def run_lingbot_map(job: dict, scan_id: str, scan_dir: Path, scan_type: str) -> 
         kv_cache_cross_frame_special=True,
         kv_cache_include_scale_frames=True,
         use_sdpa=False,
-        camera_num_iterations=2,
+        camera_num_iterations=lb_camera_iterations,
         model_path=str(model_path),
-        window_size=128,
+        window_size=lb_window_size,
         overlap_size=16,
-        overlap_keyframes=None,
-        keyframe_interval=2,
+        overlap_keyframes=lb_overlap_keyframes,
+        keyframe_interval=lb_keyframe_interval,
         offload_to_cpu=True,
         compile=False,
     )
@@ -506,7 +562,7 @@ def run_lingbot_map(job: dict, scan_id: str, scan_dir: Path, scan_type: str) -> 
     # ── Export .ply ───────────────────────────────────────────────────────
     _progress(job, "Exporting point cloud to .ply...")
     ply_path = scan_dir / "pointcloud.ply"
-    export_ply(predictions, ply_path, conf_threshold=1.5)
+    export_ply(predictions, ply_path, conf_threshold=1.5, job=job)
     return ply_path
 
 # ----------------------------
